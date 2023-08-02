@@ -1,0 +1,121 @@
+---
+- name: Check switch version
+  hosts: hylla2
+  gather_facts: no
+  vars_files:
+  - /etc/ansible/fw_upgrade.yml
+  tasks:
+    - name: Execute Python script
+      command: python3 switch_version_h2.py
+      register: script_output
+      changed_when: false
+
+    - name: Save switch model as global fact
+      set_fact:
+        switch_model: "{{ script_output.stdout_lines[0] }}"
+
+    - name: Set firmware file and version based on switch model
+      set_fact:
+        firmware_file: "{% if '3560' in switch_model %}{{ ios_3560_file }}{% elif '2000' in switch_model %}{{ ios_2000_file }}{% elif '3300' in switch_model %}{{ ios_3300_file }}{% elif '9200' in switch_model %}{{ ios_9200_file }}{% elif '9300' in switch_model %}{{ ios_9300_file }}{% endif %}"
+        firmware_version: "{% if '3560' in switch_model %}{{ ios_3560_version }}{% elif '2000' in switch_model %}{{ ios_2000_version }}{% elif '3300' in switch_model %}{{ ios_3300_version }}{% elif '9200' in switch_model %}{{ ios_9200_version }}{% elif '9300' in switch_model %}{{ ios_9300_version }}{% endif %}"
+
+- name: Get hostname from Cisco switch
+  hosts: hylla2
+  gather_facts: no
+  tasks:
+    - name: Execute show run command
+      ios_command:
+        commands:
+          - show run | include hostname
+      register: result
+
+    - name: Extract hostname
+      set_fact:
+        hostname: "{{ (result.stdout[0] | regex_search('hostname (.+)', '\\1')) }}"
+      
+    - name: Save hostname as global fact
+      add_host:
+        name: localhost
+        global_hostname: "{{ hostname }}"
+
+- name: Run bash script and save output as variable
+  hosts: main-ans
+  tasks:
+    - name: Execute the bash script
+      command: /root/netbox_api.sh "{{ hostvars['localhost'].global_hostname }}" "hylla2"
+      register: script_output
+
+    - name: Display script output
+      debug:
+        var: script_output.stdout
+
+- name: Upgrade firmware Cisco IOS
+  hosts: hylla2
+  vars_files:
+  - /etc/ansible/fw_upgrade.yml
+  tasks:
+    - name: Checking switch firmware version
+      ios_facts:
+
+    - debug:
+        msg:
+        - "Current version is {{ ansible_net_version }}"
+        - "Upgrade image is {{ firmware_version }}"
+
+    - debug:
+        msg:
+        - "Firmware will be now upgraded to the latest version"
+      when: ansible_net_version != firmware_version
+
+    - name: END PLAY FOR HOST
+      meta: end_host
+      when: ansible_net_version == firmware_version
+
+    - name: Running the software clean command
+      ios_command:
+        commands:
+          - command: 'install remove inactive'
+            prompt: 'Do you want to remove the above files?'
+            answer: 'y'
+      vars:
+        ansible_command_timeout: 300
+      when: "'3560' not in switch_model"
+
+    - name: Copy firmware to switch
+      block:
+        - name: Copying bin file. This may take a while...
+          ios_command:
+            commands:
+              - command: "copy http://10.255.155.2/tftp/firmware/{{ firmware_file }} flash:"
+          vars:
+            ansible_command_timeout: 3600
+
+    - name: Remove system boot
+      ios_config:
+        commands:
+          - "no boot system"
+        save_when: always
+
+    - name: Change Boot Variable to new image
+      ios_config:
+        commands:
+          - "boot system flash:{{ firmware_file }}"
+        save_when: always
+
+    - name: Save running config
+      ios_config:
+        save_when: always
+      vars:
+        ansible_command_timeout: 120
+
+    - name: Reload the Device
+      cli_command:
+        command: reload
+        prompt:
+          - confirm
+        answer:
+          - 'y'
+
+    - debug:
+        msg:
+        - "Switch upgrade successful and the switch is reloading. You can close this window."
